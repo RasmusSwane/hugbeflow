@@ -138,8 +138,28 @@ class RotatingNvidiaChatOpenAI(ChatOpenAI):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
-        stream = await self._acall_with_rotation(
-            lambda delegate: delegate._astream(messages, stop=stop, run_manager=run_manager, **kwargs)
-        )
-        async for chunk in stream:
-            yield chunk
+        last_rate_limit_error = None
+        for _ in range(len(self._nvidia_rotator.keys)):
+            key = self._nvidia_rotator.next_key()
+            if key is None:
+                break
+
+            model_kwargs = dict(self._delegate_kwargs)
+            model_kwargs["api_key"] = key
+            delegate = ChatOpenAI(**model_kwargs)
+            try:
+                async for chunk in delegate._astream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001
+                if _is_rate_limit_error(exc):
+                    self._nvidia_rotator.mark_rate_limited(key)
+                    last_rate_limit_error = exc
+                    continue
+                raise
+
+        raise RuntimeError(
+            "All NVIDIA API keys are currently rate-limited or cooling down"
+        ) from last_rate_limit_error
