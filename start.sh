@@ -271,7 +271,7 @@ thinking      = os.environ.get("SUPPORTS_THINKING", "false").lower() == "true"
 
 if provider_kind == "nvidia":
     provider_blob = os.environ.get("NVIDIA_PROVIDER_JSON", "{}")
-    api_keys = os.environ.get("NVIDIA_API_KEYS", "") or os.environ.get("NVIDIA_API_KEYS_COMPACT", "")
+    api_keys = os.environ.get("NVIDIA_API_KEYS_COMPACT", "")
     try:
         provider_cfg = json.loads(provider_blob)
     except Exception as exc:

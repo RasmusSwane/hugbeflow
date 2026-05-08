@@ -1,7 +1,7 @@
 import re
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Sequence
 
 from langchain_openai import ChatOpenAI
 
@@ -62,11 +62,9 @@ class RotatingNvidiaChatOpenAI(ChatOpenAI):
         if not keys:
             raise ValueError("NVIDIA provider requires at least one API key")
 
-        delegate_kwargs = dict(kwargs)
-        delegate_kwargs.setdefault("max_retries", 0)
-
         kwargs.setdefault("api_key", keys[0])
         kwargs.setdefault("max_retries", 0)
+        delegate_kwargs = dict(kwargs)
         super().__init__(**kwargs)
 
         object.__setattr__(self, "_nvidia_rotator", _ApiKeyRotator(keys, int(cooldown_seconds)))
@@ -139,9 +137,9 @@ class RotatingNvidiaChatOpenAI(ChatOpenAI):
         stop: list[str] | None = None,
         run_manager: Any = None,
         **kwargs: Any,
-    ):
+    ) -> AsyncIterator[Any]:
         stream = await self._acall_with_rotation(
             lambda delegate: delegate._astream(messages, stop=stop, run_manager=run_manager, **kwargs)
         )
-        async for chunk in stream:  # type: ignore[func-returns-value]
+        async for chunk in stream:
             yield chunk
