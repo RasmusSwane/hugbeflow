@@ -36,10 +36,10 @@ echo ""
 
 # ── Required env validation ───────────────────────────────────────
 ERRORS=""
-if [ -z "${LLM_MODEL:-}" ]; then
+if [ -z "${LLM_MODEL:-}" ] && [ -z "${NVIDIA_PROVIDER_JSON:-}" ]; then
   ERRORS="${ERRORS}  - LLM_MODEL is not set (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5)\n"
 fi
-if [ -z "${LLM_API_KEY:-}" ]; then
+if [ -z "${LLM_API_KEY:-}" ] && [ -z "${NVIDIA_API_KEYS:-}" ]; then
   ERRORS="${ERRORS}  - LLM_API_KEY is not set\n"
 fi
 if [ -n "$ERRORS" ]; then
@@ -107,6 +107,10 @@ LANGCHAIN_CLASS="langchain_openai:ChatOpenAI"
 API_KEY_FIELD="api_key"
 MODEL_BASE_URL=""
 SUPPORTS_THINKING="false"
+PROVIDER_KIND="standard"
+NVIDIA_PROVIDER_JSON="${NVIDIA_PROVIDER_JSON:-}"
+NVIDIA_API_KEYS_RAW="${NVIDIA_API_KEYS:-}"
+NVIDIA_API_KEYS_COMPACT=""
 
 case "$LLM_PROVIDER" in
   anthropic)
@@ -169,6 +173,19 @@ case "$LLM_PROVIDER" in
     API_KEY_FIELD="api_key"
     MODEL_BASE_URL="https://api.groq.com/openai/v1"
     ;;
+  nvidia)
+    PROVIDER_KIND="nvidia"
+    LANGCHAIN_CLASS="langchain_openai:ChatOpenAI"
+    API_KEY_FIELD="api_key"
+    MODEL_BASE_URL="https://integrate.api.nvidia.com/v1"
+    if [ -z "$NVIDIA_PROVIDER_JSON" ]; then
+      echo "NVIDIA_PROVIDER_JSON must be set when LLM_MODEL=nvidia/..."
+      exit 1
+    fi
+    NVIDIA_API_KEYS_COMPACT=$(printf '%s' "$NVIDIA_API_KEYS_RAW" | tr '\n' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')
+    export NVIDIA_API_KEYS_COMPACT
+    export NVIDIA_PROVIDER_JSON
+    ;;
   openai|*)
     export OPENAI_API_KEY="${OPENAI_API_KEY:-$LLM_API_KEY}"
     LANGCHAIN_CLASS="langchain_openai:ChatOpenAI"
@@ -184,7 +201,7 @@ if [ -n "${CUSTOM_BASE_URL:-}" ]; then
   MODEL_BASE_URL="$CUSTOM_BASE_URL"
 fi
 
-export LLM_PROVIDER LLM_MODEL_NAME LANGCHAIN_CLASS API_KEY_FIELD MODEL_BASE_URL SUPPORTS_THINKING
+export LLM_PROVIDER LLM_MODEL_NAME LANGCHAIN_CLASS API_KEY_FIELD MODEL_BASE_URL SUPPORTS_THINKING PROVIDER_KIND
 export SERPER_API_KEY="${SERPER_API_KEY:-}"
 export TAVILY_API_KEY="${TAVILY_API_KEY:-}"
 export JINA_API_KEY="${JINA_API_KEY:-}"
@@ -200,7 +217,7 @@ fi
 # ── Generate config.yaml ──────────────────────────────────────────
 echo "Generating config.yaml..."
 python3 - <<'PYEOF'
-import os, yaml
+import json, os, yaml
 from pathlib import Path
 
 data_dir = Path(os.environ["DATA_DIR"])
@@ -216,6 +233,7 @@ if not config_path.exists():
 else:
     base = yaml.safe_load(config_path.read_text()) or {}
 
+provider_kind = os.environ.get("PROVIDER_KIND", "standard")
 model_name   = os.environ["LLM_MODEL_NAME"]
 lc_class     = os.environ["LANGCHAIN_CLASS"]
 api_key_field = os.environ["API_KEY_FIELD"]
@@ -223,24 +241,49 @@ base_url      = os.environ.get("MODEL_BASE_URL", "")
 llm_api_key   = os.environ.get("LLM_API_KEY", "")
 thinking      = os.environ.get("SUPPORTS_THINKING", "false").lower() == "true"
 
-# Build model entry
-model_entry = {
-    "name": model_name,
-    "display_name": model_name,
-    "use": lc_class,
-    "model": model_name,
-    api_key_field: llm_api_key,
-    "request_timeout": 600.0,
-    "max_retries": 2,
-    "max_tokens": 8192,
-}
-if base_url:
-    model_entry["base_url"] = base_url
-if thinking:
-    model_entry["supports_thinking"] = True
+if provider_kind == "nvidia":
+    provider_blob = os.environ.get("NVIDIA_PROVIDER_JSON", "{}")
+    api_keys = os.environ.get("NVIDIA_API_KEYS_COMPACT", "")
+    try:
+        provider_cfg = json.loads(provider_blob)
+    except Exception as exc:
+        raise SystemExit(f"NVIDIA_PROVIDER_JSON is not valid JSON: {exc}")
 
-# Override models section with our single configured model
-base["models"] = [model_entry]
+    if not isinstance(provider_cfg, dict):
+        raise SystemExit("NVIDIA_PROVIDER_JSON must decode to a JSON object")
+
+    if api_keys:
+        provider_cfg["apiKeyRotation"] = {
+            "strategy": "round_robin",
+            "env": "NVIDIA_API_KEYS",
+            "keys": api_keys.split(","),
+            "cooldownSeconds": int(os.environ.get("NVIDIA_KEY_COOLDOWN_SECONDS", "60")),
+            "retryOnRateLimit": True,
+        }
+
+    provider_cfg.setdefault("baseUrl", base_url)
+    provider_cfg.setdefault("api", "openai-completions")
+    base["models"] = provider_cfg.get("models", [])
+    base["nvidia_provider"] = provider_cfg
+else:
+    # Build model entry
+    model_entry = {
+        "name": model_name,
+        "display_name": model_name,
+        "use": lc_class,
+        "model": model_name,
+        api_key_field: llm_api_key,
+        "request_timeout": 600.0,
+        "max_retries": 2,
+        "max_tokens": 8192,
+    }
+    if base_url:
+        model_entry["base_url"] = base_url
+    if thinking:
+        model_entry["supports_thinking"] = True
+
+    # Override models section with our single configured model
+    base["models"] = [model_entry]
 
 # Sandbox: local (no Docker on HF Spaces)
 base.setdefault("sandbox", {})
@@ -322,6 +365,9 @@ echo ""
 echo "Model     : $LLM_MODEL"
 echo "Provider  : $LLM_PROVIDER"
 echo "Data dir  : $DATA_DIR"
+if [ "$LLM_PROVIDER" = "nvidia" ]; then
+  echo "NVIDIA    : NVIDIA_PROVIDER_JSON + NVIDIA_API_KEYS"
+fi
 if [ -n "${SERPER_API_KEY:-}" ]; then
   echo "Search    : Serper (Google)"
 elif [ -n "${TAVILY_API_KEY:-}" ]; then

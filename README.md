@@ -12,6 +12,10 @@ secrets:
     description: "Model in provider/model-name format — e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5, google/gemini-2.5-flash"
   - name: LLM_API_KEY
     description: API key for the chosen LLM provider.
+  - name: NVIDIA_PROVIDER_JSON
+    description: "JSON blob for NVIDIA provider/model configuration, including models and provider settings."
+  - name: NVIDIA_API_KEYS
+    description: "Comma- or newline-separated NVIDIA API keys used with round-robin rotation and retry on rate limits."
   - name: HF_TOKEN
     description: Hugging Face token (write access) — enables thread backup/restore to a private HF Dataset.
   - name: SERPER_API_KEY
@@ -74,7 +78,7 @@ DeerFlow conducts multi-step research: it queries search engines, fetches web pa
 ## Features
 
 - 🚀 **One-click deploy** — duplicate the HF Space, add secrets, done
-- 🧠 **Multi-provider LLM** — OpenAI, Anthropic, Google Gemini, DeepSeek, Groq, Mistral, xAI, OpenRouter, Qwen, Moonshot, any OpenAI-compatible endpoint
+- 🧠 **Multi-provider LLM** — OpenAI, Anthropic, Google Gemini, DeepSeek, Groq, Mistral, xAI, OpenRouter, Qwen, Moonshot, any OpenAI-compatible endpoint, NVIDIA
 - 🔍 **Pluggable search** — Serper (Google), Tavily, or DuckDuckGo (no key needed)
 - 💾 **Dataset backup** — threads auto-sync to a private HF Dataset; restored on restart
 - 🌐 **Cloudflare outbound proxy** — route backend traffic through a Cloudflare Worker (beats HF Spaces IP blocks on some APIs)
@@ -100,6 +104,8 @@ In your new Space → **Settings → Variables and Secrets**, add at minimum:
 |--------|-------------|
 | `LLM_MODEL` | Model in `provider/model-name` format — e.g. `openai/gpt-4o` |
 | `LLM_API_KEY` | API key for the chosen provider |
+| `NVIDIA_PROVIDER_JSON` | NVIDIA provider/model JSON blob |
+| `NVIDIA_API_KEYS` | Comma- or newline-separated NVIDIA API keys |
 
 > [!TIP]
 > Add `HF_TOKEN` (a token with write access to your account) to enable thread backup persistence. Without it, all research threads are lost on restart.
@@ -126,6 +132,8 @@ Open `/workspace` — you're live 🎉
 |--------|-------------|
 | `LLM_MODEL` | Model in `provider/model-name` format — see [LLM Providers](#llm-providers) |
 | `LLM_API_KEY` | API key for the chosen provider |
+| `NVIDIA_PROVIDER_JSON` | NVIDIA provider/model JSON blob |
+| `NVIDIA_API_KEYS` | Comma- or newline-separated NVIDIA API keys |
 
 ### Optional Variables
 
@@ -143,6 +151,7 @@ Open `/workspace` — you're live 🎉
 | `FRONTEND_READY_TIMEOUT` | `120` | Seconds to wait for frontend startup |
 | `CLOUDFLARE_WORKERS_TOKEN` | — | Cloudflare API token — enables outbound proxy + keep-awake cron |
 | `CLOUDFLARE_PROXY_URL` | — | Existing Cloudflare Worker URL (skip auto-setup) |
+| `NVIDIA_KEY_COOLDOWN_SECONDS` | `60` | Cooldown time for NVIDIA keys after rate limiting |
 
 ---
 
@@ -162,9 +171,48 @@ Set `LLM_MODEL` to `provider/model-name`:
 | **OpenRouter** | `openrouter/anthropic/claude-3-5-sonnet` | Access 200+ models |
 | **Qwen / Alibaba** | `qwen/qwen-max` | DashScope compatible |
 | **Moonshot / Kimi** | `moonshot/moonshot-v1-128k` | |
+| **NVIDIA** | `nvidia/moonshotai/kimi-k2.6` | Uses `NVIDIA_PROVIDER_JSON` + `NVIDIA_API_KEYS` |
 | **Custom OpenAI-compat** | `openai/your-model` + `CUSTOM_BASE_URL` | Any self-hosted endpoint |
 
 > **Tip:** Models with extended thinking (Anthropic, Gemini, DeepSeek) produce higher-quality research plans but use more tokens.
+
+---
+
+## NVIDIA Provider Configuration
+
+Use NVIDIA when you want to supply a full provider/model JSON blob and rotate through multiple keys.
+
+Example:
+
+```json
+{
+  "baseUrl": "https://integrate.api.nvidia.com/v1",
+  "api": "openai-completions",
+  "models": [
+    {
+      "id": "moonshotai/kimi-k2.6",
+      "name": "Kimi K2.6 (NVIDIA)",
+      "reasoning": true,
+      "input": ["text"],
+      "contextWindow": 200000,
+      "maxTokens": 16384
+    }
+  ]
+}
+```
+
+Set:
+
+- `LLM_MODEL=nvidia/moonshotai/kimi-k2.6`
+- `NVIDIA_PROVIDER_JSON=<json above>`
+- `NVIDIA_API_KEYS=key1,key2,key3`
+
+Rotation behavior:
+
+- keys are parsed from comma- or newline-separated values
+- requests use round-robin selection
+- rate-limited keys cool down temporarily
+- retries continue with the next key
 
 ---
 
@@ -299,7 +347,7 @@ Open `http://localhost:7860` for the dashboard, `http://localhost:7860/setup` to
 ## Troubleshooting
 
 **"Application error" on `/workspace` or `/setup`**
-> The pre-built frontend requires `DEER_FLOW_TRUSTED_ORIGINS` to be set explicitly. `start.sh` handles this automatically. If you see this error in a custom setup, ensure the env var is set before starting Next.js.
+> The pre-built frontend requires `DEER_FLOW_TRUSTED_ORIGINS` to be set explicitly. `start.sh` handles this automatically. If you see this error in a custom setup, ensure the env var is set before launching the frontend.
 
 **Build takes 30+ minutes / OOMKilled**
 > Ensure Docker has ≥4 GB RAM. HuggingFlow uses pre-built images specifically to avoid compilation. If you're rebuilding from source, add `NODE_OPTIONS=--max-old-space-size=3072`.
