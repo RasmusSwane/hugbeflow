@@ -98,6 +98,7 @@ COPY --from=source --chown=1000:1000 /src/config.example.yaml /app/config.exampl
 COPY --chown=1000:1000 nginx.conf                    /etc/nginx/nginx.conf
 COPY --chown=1000:1000 start.sh                      /app/start.sh
 COPY --chown=1000:1000 deerflow-sync.py              /app/deerflow-sync.py
+COPY --chown=1000:1000 huggingflow_nvidia.py         /app/backend/huggingflow_nvidia.py
 COPY --chown=1000:1000 health-server.js              /app/health-server.js
 COPY --chown=1000:1000 cloudflare-proxy.js           /app/cloudflare-proxy.js
 COPY --chown=1000:1000 cloudflare-proxy-setup.py     /app/cloudflare-proxy-setup.py

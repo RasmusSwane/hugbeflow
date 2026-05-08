@@ -17,6 +17,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       NVIDIA_PROVIDER_JSON: ${NVIDIA_PROVIDER_JSON:-}
       NVIDIA_API_KEYS: ${NVIDIA_API_KEYS:-}
+      NVIDIA_KEY_COOLDOWN_SECONDS: ${NVIDIA_KEY_COOLDOWN_SECONDS:-60}
 
       # ── Search (optional) ────────────────────────────────────────
       SERPER_API_KEY: ${SERPER_API_KEY:-}

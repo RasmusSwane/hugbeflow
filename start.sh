@@ -36,11 +36,30 @@ echo ""
 
 # ── Required env validation ───────────────────────────────────────
 ERRORS=""
-if [ -z "${LLM_MODEL:-}" ] && [ -z "${NVIDIA_PROVIDER_JSON:-}" ]; then
-  ERRORS="${ERRORS}  - LLM_MODEL is not set (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5)\n"
+LLM_PROVIDER_HINT=""
+if [ -n "${LLM_MODEL:-}" ]; then
+  LLM_PROVIDER_HINT=$(echo "$LLM_MODEL" | cut -d'/' -f1)
 fi
-if [ -z "${LLM_API_KEY:-}" ] && [ -z "${NVIDIA_API_KEYS:-}" ]; then
-  ERRORS="${ERRORS}  - LLM_API_KEY is not set\n"
+
+USING_NVIDIA="false"
+if [ "$LLM_PROVIDER_HINT" = "nvidia" ] || { [ -z "${LLM_MODEL:-}" ] && [ -n "${NVIDIA_PROVIDER_JSON:-}" ]; }; then
+  USING_NVIDIA="true"
+fi
+
+if [ "$USING_NVIDIA" = "true" ]; then
+  if [ -z "${NVIDIA_PROVIDER_JSON:-}" ]; then
+    ERRORS="${ERRORS}  - NVIDIA_PROVIDER_JSON is required for NVIDIA provider mode\n"
+  fi
+  if [ -z "${NVIDIA_API_KEYS:-}" ] && [ -z "${LLM_API_KEY:-}" ]; then
+    ERRORS="${ERRORS}  - NVIDIA_API_KEYS is not set (LLM_API_KEY may be used as single-key fallback)\n"
+  fi
+else
+  if [ -z "${LLM_MODEL:-}" ]; then
+    ERRORS="${ERRORS}  - LLM_MODEL is not set (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5)\n"
+  fi
+  if [ -z "${LLM_API_KEY:-}" ]; then
+    ERRORS="${ERRORS}  - LLM_API_KEY is not set\n"
+  fi
 fi
 if [ -n "$ERRORS" ]; then
   echo "Missing required secrets:"
@@ -99,8 +118,14 @@ fi
 
 # ── Provider → env var + langchain class mapping ──────────────────
 # Parse LLM_MODEL in format "provider/model-name" (e.g. "openai/gpt-4o")
-LLM_PROVIDER=$(echo "$LLM_MODEL" | cut -d'/' -f1)
-LLM_MODEL_NAME=$(echo "$LLM_MODEL" | cut -d'/' -f2-)
+LLM_PROVIDER="${LLM_PROVIDER_HINT:-}"
+LLM_MODEL_NAME=""
+if [ -n "${LLM_MODEL:-}" ]; then
+  LLM_MODEL_NAME=$(echo "$LLM_MODEL" | cut -d'/' -f2-)
+fi
+if [ -z "$LLM_PROVIDER" ] && [ "$USING_NVIDIA" = "true" ]; then
+  LLM_PROVIDER="nvidia"
+fi
 
 # Resolve provider-specific settings
 LANGCHAIN_CLASS="langchain_openai:ChatOpenAI"
@@ -183,6 +208,9 @@ case "$LLM_PROVIDER" in
       exit 1
     fi
     NVIDIA_API_KEYS_COMPACT=$(printf '%s' "$NVIDIA_API_KEYS_RAW" | tr '\n' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')
+    if [ -z "$NVIDIA_API_KEYS_COMPACT" ] && [ -n "${LLM_API_KEY:-}" ]; then
+      NVIDIA_API_KEYS_COMPACT="$LLM_API_KEY"
+    fi
     export NVIDIA_API_KEYS_COMPACT
     export NVIDIA_PROVIDER_JSON
     ;;
@@ -252,18 +280,65 @@ if provider_kind == "nvidia":
     if not isinstance(provider_cfg, dict):
         raise SystemExit("NVIDIA_PROVIDER_JSON must decode to a JSON object")
 
-    if api_keys:
-        provider_cfg["apiKeyRotation"] = {
-            "strategy": "round_robin",
-            "env": "NVIDIA_API_KEYS",
-            "keys": api_keys.split(","),
-            "cooldownSeconds": int(os.environ.get("NVIDIA_KEY_COOLDOWN_SECONDS", "60")),
-            "retryOnRateLimit": True,
-        }
+    provider_models = provider_cfg.get("models", [])
+    if not isinstance(provider_models, list) or not provider_models:
+        raise SystemExit("NVIDIA_PROVIDER_JSON must include a non-empty models array")
 
-    provider_cfg.setdefault("baseUrl", base_url)
-    provider_cfg.setdefault("api", "openai-completions")
-    base["models"] = provider_cfg.get("models", [])
+    parsed_keys = [k.strip() for k in api_keys.replace("\n", ",").split(",") if k.strip()]
+    if not parsed_keys and llm_api_key:
+        parsed_keys = [llm_api_key]
+    if not parsed_keys:
+        raise SystemExit("No valid NVIDIA API keys found in NVIDIA_API_KEYS (or fallback LLM_API_KEY)")
+
+    cooldown_seconds = int(os.environ.get("NVIDIA_KEY_COOLDOWN_SECONDS", "60"))
+    if cooldown_seconds < 1:
+        cooldown_seconds = 1
+
+    provider_base_url = provider_cfg.get("baseUrl") or base_url or "https://integrate.api.nvidia.com/v1"
+    provider_api = provider_cfg.get("api", "openai-completions")
+
+    models = []
+    for idx, model in enumerate(provider_models):
+        if not isinstance(model, dict):
+            raise SystemExit(f"NVIDIA_PROVIDER_JSON models[{idx}] must be an object")
+        model_id = str(model.get("id", "")).strip()
+        if not model_id:
+            raise SystemExit(f"NVIDIA_PROVIDER_JSON models[{idx}].id is required")
+
+        max_tokens = model.get("maxTokens", 8192)
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            max_tokens = 8192
+
+        model_entry = {
+            "name": model_id,
+            "display_name": model.get("name", model_id),
+            "use": "huggingflow_nvidia:RotatingNvidiaChatOpenAI",
+            "model": model_id,
+            "api_key": parsed_keys[0],
+            "base_url": provider_base_url,
+            "request_timeout": 600.0,
+            "max_retries": 0,
+            "max_tokens": max_tokens,
+            "nvidia_api_keys": parsed_keys,
+            "nvidia_key_cooldown_seconds": cooldown_seconds,
+        }
+        if model.get("reasoning"):
+            model_entry["supports_thinking"] = True
+        models.append(model_entry)
+
+    provider_cfg["baseUrl"] = provider_base_url
+    provider_cfg["api"] = provider_api
+    provider_cfg["apiKeyRotation"] = {
+        "strategy": "round_robin",
+        "env": "NVIDIA_API_KEYS",
+        "keys": parsed_keys,
+        "cooldownSeconds": cooldown_seconds,
+        "retryOnRateLimit": True,
+    }
+
+    base["models"] = models
     base["nvidia_provider"] = provider_cfg
 else:
     # Build model entry
@@ -362,7 +437,7 @@ fi
 
 # ── Startup summary ───────────────────────────────────────────────
 echo ""
-echo "Model     : $LLM_MODEL"
+echo "Model     : ${LLM_MODEL:-nvidia (from NVIDIA_PROVIDER_JSON)}"
 echo "Provider  : $LLM_PROVIDER"
 echo "Data dir  : $DATA_DIR"
 if [ "$LLM_PROVIDER" = "nvidia" ]; then
