@@ -162,7 +162,7 @@ def _read_last_fingerprint(repo_id: str) -> str | None:
         if isinstance(fingerprint, str) and fingerprint:
             return fingerprint
     except FileNotFoundError:
-        return None
+        pass
     except Exception as exc:
         log.debug("Could not read sync fingerprint: %s", exc)
     return None
