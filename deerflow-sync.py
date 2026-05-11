@@ -21,6 +21,7 @@ import time
 import tarfile
 import tempfile
 import logging
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +37,9 @@ SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))
 
 ARCHIVE_NAME     = "deerflow-state.tar.gz"
 SYNC_STATUS_FILE = "/tmp/huggingflow-sync-status.json"
+SYNC_FINGERPRINT_FILE = DATA_DIR / ".deerflow-sync-fingerprint.json"
+_FINGERPRINT_HASH_CHUNK_SIZE = 1024 * 1024
+_FINGERPRINT_FILE_MAX_BYTES = 64 * 1024
 
 # Files/dirs to include in the backup archive
 BACKUP_TARGETS = [
@@ -114,24 +118,82 @@ def _should_exclude(path: Path) -> bool:
     return path.suffix in _SQLITE_AUX_SUFFIXES
 
 
+def _iter_backup_files():
+    for target in BACKUP_TARGETS:
+        if not target.exists():
+            continue
+        if target.is_file():
+            if not _should_exclude(target):
+                yield target
+        elif target.is_dir():
+            for child in sorted(target.rglob("*")):
+                if child.is_file() and not _should_exclude(child):
+                    yield child
+
+
+def _compute_backup_fingerprint() -> str:
+    """Compute deterministic fingerprint of backup-relevant inputs."""
+    _checkpoint_sqlite()
+    hasher = hashlib.sha256()
+    file_count = 0
+
+    for path in _iter_backup_files():
+        file_count += 1
+        arcname = path.relative_to(DATA_DIR.parent).as_posix()
+        stat = path.stat()
+        hasher.update(arcname.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(str(stat.st_size).encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+        hasher.update(b"\0")
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(_FINGERPRINT_HASH_CHUNK_SIZE), b""):
+                hasher.update(chunk)
+
+    hasher.update(f"files={file_count}".encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _read_last_fingerprint(repo_id: str) -> str | None:
+    try:
+        if SYNC_FINGERPRINT_FILE.stat().st_size > _FINGERPRINT_FILE_MAX_BYTES:
+            log.warning("Sync fingerprint file is too large; ignoring it.")
+            return None
+
+        payload = json.loads(SYNC_FINGERPRINT_FILE.read_text())
+        if payload.get("repo_id") != repo_id:
+            return None
+        fingerprint = payload.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            return fingerprint
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log.debug("Could not read sync fingerprint: %s", exc)
+    return None
+
+
+def _write_last_fingerprint(repo_id: str, fingerprint: str):
+    try:
+        payload = {
+            "repo_id": repo_id,
+            "fingerprint": fingerprint,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        SYNC_FINGERPRINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SYNC_FINGERPRINT_FILE.write_text(json.dumps(payload))
+    except Exception as exc:
+        log.debug("Could not write sync fingerprint: %s", exc)
+
+
 def _make_archive(dest: Path):
     _checkpoint_sqlite()
     with tarfile.open(dest, "w:gz") as tar:
-        for target in BACKUP_TARGETS:
-            if not target.exists():
-                continue
-            if target.is_file():
-                if _should_exclude(target):
-                    continue
-                arcname = target.relative_to(DATA_DIR.parent)
-                tar.add(target, arcname=str(arcname))
-                log.debug("  + %s", arcname)
-            elif target.is_dir():
-                for child in sorted(target.rglob("*")):
-                    if child.is_file() and not _should_exclude(child):
-                        arcname = child.relative_to(DATA_DIR.parent)
-                        tar.add(child, arcname=str(arcname))
-                        log.debug("  + %s", arcname)
+        for path in _iter_backup_files():
+            arcname = path.relative_to(DATA_DIR.parent)
+            tar.add(path, arcname=str(arcname))
+            log.debug("  + %s", arcname)
 
 
 def _extract_archive(src: Path):
@@ -215,6 +277,13 @@ def sync_once():
         repo_id = _resolve_repo_id(api)
         _ensure_repo(api, repo_id)
 
+        current_fingerprint = _compute_backup_fingerprint()
+        previous_fingerprint = _read_last_fingerprint(repo_id)
+        if previous_fingerprint == current_fingerprint:
+            log.info("Backup state unchanged — skipping upload.")
+            _write_status("unchanged", f"No changes detected since last sync to {repo_id}.")
+            return
+
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / ARCHIVE_NAME
             _make_archive(archive)
@@ -227,6 +296,7 @@ def sync_once():
             size_kb = archive.stat().st_size // 1024
             log.info("Uploading state archive (%d KB) to %s...", size_kb, repo_id)
             _upload_with_retry(api, archive, repo_id)
+            _write_last_fingerprint(repo_id, current_fingerprint)
             log.info("State synced to %s (%d KB)", repo_id, size_kb)
             _write_status("synced", f"Synced to {repo_id} ({size_kb} KB)")
     except Exception as exc:
