@@ -37,7 +37,9 @@ SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))
 
 ARCHIVE_NAME     = "deerflow-state.tar.gz"
 SYNC_STATUS_FILE = "/tmp/huggingflow-sync-status.json"
-SYNC_FINGERPRINT_FILE = DATA_DIR / ".huggingflow-sync-fingerprint.json"
+SYNC_FINGERPRINT_FILE = DATA_DIR / ".deerflow-sync-fingerprint.json"
+_FINGERPRINT_HASH_CHUNK_SIZE = 1024 * 1024
+_FINGERPRINT_MAX_BYTES = 64 * 1024
 
 # Files/dirs to include in the backup archive
 BACKUP_TARGETS = [
@@ -146,7 +148,7 @@ def _compute_backup_fingerprint() -> str:
         hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
         hasher.update(b"\0")
         with path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            for chunk in iter(lambda: fh.read(_FINGERPRINT_HASH_CHUNK_SIZE), b""):
                 hasher.update(chunk)
 
     hasher.update(f"files={file_count}".encode("utf-8"))
@@ -155,6 +157,10 @@ def _compute_backup_fingerprint() -> str:
 
 def _read_last_fingerprint(repo_id: str) -> str | None:
     try:
+        if SYNC_FINGERPRINT_FILE.stat().st_size > _FINGERPRINT_MAX_BYTES:
+            log.warning("Sync fingerprint file is too large; ignoring it.")
+            return None
+
         payload = json.loads(SYNC_FINGERPRINT_FILE.read_text())
         if payload.get("repo_id") != repo_id:
             return None
